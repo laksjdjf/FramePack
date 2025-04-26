@@ -2,7 +2,7 @@ from diffusers_helper.hf_login import login
 
 import os
 
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+#os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 import gradio as gr
 import torch
@@ -30,7 +30,7 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='0.0.0.0')
+parser.add_argument("--server", type=str, default='127.0.0.1')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 args = parser.parse_args()
@@ -46,7 +46,7 @@ high_vram = free_mem_gb > 60
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
+text_encoder = LlamaModel.from_pretrained("furusu/hv_llama_nf4", torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
@@ -55,7 +55,7 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_transformer_nf4', torch_dtype=torch.bfloat16).cpu()
 
 vae.eval()
 text_encoder.eval()
@@ -70,10 +70,10 @@ if not high_vram:
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
 
-transformer.to(dtype=torch.bfloat16)
+#transformer.to(dtype=torch.bfloat16) # comment out for bnb 4bit
 vae.to(dtype=torch.float16)
 image_encoder.to(dtype=torch.float16)
-text_encoder.to(dtype=torch.float16)
+#text_encoder.to(dtype=torch.float16) # comment out for bnb 4bit
 text_encoder_2.to(dtype=torch.float16)
 
 vae.requires_grad_(False)
@@ -98,9 +98,20 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
+def calc_total_latent_sections(total_second_length, latent_window_size):
+    total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
+    total_latent_sections = int(max(round(total_latent_sections), 1))
+    return total_latent_sections
+
+def section_title_update(total_second_length, latent_window_size):
+    total_latent_sections = calc_total_latent_sections(total_second_length, latent_window_size)
+    visibles = [gr.update(visible=True) for _ in range(total_latent_sections)] + [gr.update(visible=False) for _ in range(10 - total_latent_sections)]
+
+    output = [f'## 総セクション数は{total_latent_sections}だよーん。'] + visibles * 2
+    return output
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, section_keyframes, paddings):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -146,6 +157,24 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
+        if end_image is not None:
+            end_image_np = resize_and_center_crop(end_image, target_width=width, target_height=height)
+            end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
+            end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
+
+        key_frames_pt = []
+        key_frames_np = []
+        for i in range(total_second_length):
+            if section_keyframes[i] is not None:
+                section_keyframe_np = resize_and_center_crop(section_keyframes[i], target_width=width, target_height=height)
+                section_keyframe_pt = torch.from_numpy(section_keyframe_np) / 127.5 - 1
+                section_keyframe_pt = section_keyframe_pt.permute(2, 0, 1)[None, :, None]
+                key_frames_pt.append(section_keyframe_pt)
+                key_frames_np.append(section_keyframe_np)
+            else:
+                key_frames_pt.append(None)
+                key_frames_np.append(None)
+
         # VAE encoding
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
@@ -154,6 +183,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             load_model_as_complete(vae, target_device=gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
+        key_frame_latents = []
+        for key_frame_pt in key_frames_pt:
+            if key_frame_pt is not None:
+                key_frame_latent = vae_encode(key_frame_pt, vae)
+                key_frame_latents.append(key_frame_latent)
+            else:
+                key_frame_latents.append(start_latent)
+
+        end_latent = vae_encode(end_image_pt, vae)
 
         # CLIP Vision
 
@@ -164,6 +202,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        key_frame_image_encoder_last_hidden_states = []
+        for key_frame_np in key_frames_np:
+            if key_frame_np is not None:
+                key_frame_image_encoder_output = hf_clip_vision_encode(key_frame_np, feature_extractor, image_encoder)
+                key_frame_image_encoder_last_hidden_states.append(key_frame_image_encoder_output.last_hidden_state.to(transformer.dtype))
+            else:
+                key_frame_image_encoder_last_hidden_states.append(image_encoder_last_hidden_state.to(transformer.dtype))
 
         # Dtype
 
@@ -181,10 +227,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         num_frames = latent_window_size * 4 - 3
 
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        if end_image is not None:
+            history_latents[:, :, :1] = end_latent.to(history_latents)
         history_pixels = None
         total_generated_latent_frames = 0
 
-        latent_paddings = reversed(range(total_latent_sections))
+        latent_paddings = list(reversed(range(total_latent_sections)))
 
         if total_latent_sections > 4:
             # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
@@ -193,8 +241,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-        for latent_padding in latent_paddings:
-            is_last_section = latent_padding == 0
+        for i in range(total_latent_sections):
+            if paddings[i] >= 0:
+                latent_paddings[i] = paddings[i]
+
+        for i, latent_padding in enumerate(latent_paddings):
+            is_last_section = i == (total_latent_sections - 1)
             latent_padding_size = latent_padding * latent_window_size
 
             if stream.input_queue.top() == 'end':
@@ -207,7 +259,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-            clean_latents_pre = start_latent.to(history_latents)
+            clean_latents_pre = key_frame_latents[i].to(history_latents)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
@@ -233,7 +285,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
-                hint = f'Sampling {current_step}/{steps}'
+                hint = f'Section {i+1}/{total_latent_sections}, Sampling {current_step}/{steps}'
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
@@ -258,7 +310,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
                 dtype=torch.bfloat16,
-                image_embeddings=image_encoder_last_hidden_state,
+                image_embeddings=key_frame_image_encoder_last_hidden_states[i],
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
                 clean_latent_indices=clean_latent_indices,
@@ -269,7 +321,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 callback=callback,
             )
 
-            if is_last_section:
+            if is_last_section and paddings[i] == 0:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
             total_generated_latent_frames += int(generated_latents.shape[2])
@@ -315,7 +367,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def process(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, *args):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -323,7 +375,10 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+    section_keyframes = args[0:10]
+    paddings = args[10:20]
+
+    async_run(worker, input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, section_keyframes, paddings)
 
     output_filename = None
 
@@ -360,7 +415,9 @@ with block:
     gr.Markdown('# FramePack')
     with gr.Row():
         with gr.Column():
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            with gr.Row():
+                input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+                end_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
@@ -386,6 +443,16 @@ with block:
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
+            
+            with gr.Group():
+                first_total_sections = calc_total_latent_sections(5, 9)
+                section_title = gr.Markdown(f'## 総セクション数は{first_total_sections}だよーん。')
+                section_keyframes = []
+                paddings = []
+                for i in range(10):
+                    with gr.Row():
+                        section_keyframes.append(gr.Image(sources='upload', type="numpy", label="Image", height=320, visible= i < first_total_sections))
+                        paddings.append(gr.Number(label=f"Section {i} Padding", minimum=-1, maximum=20, value=-1, step=1, visible= i < first_total_sections))
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -396,9 +463,15 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf] + section_keyframes + paddings
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
+
+    total_second_length.change(
+        fn=section_title_update,
+        inputs=[total_second_length, latent_window_size],
+        outputs=[section_title] + section_keyframes + paddings,
+    )
 
 
 block.launch(
