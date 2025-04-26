@@ -82,8 +82,7 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
         
         #Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
 
-        if end_image is not None:
-            end_image_np, end_image_pt = get_image_np_pt(end_image, width, height)
+        end_image_np, end_image_pt = get_image_np_pt(end_image, width, height)
 
         key_frames_pt, key_frames_np = [], []
         for i in range(total_latent_sections):
