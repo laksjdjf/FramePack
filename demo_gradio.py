@@ -164,7 +164,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
         key_frames_pt = []
         key_frames_np = []
-        for i in range(total_second_length):
+        for i in range(total_latent_sections):
             if section_keyframes[i] is not None:
                 section_keyframe_np = resize_and_center_crop(section_keyframes[i], target_width=width, target_height=height)
                 section_keyframe_pt = torch.from_numpy(section_keyframe_np) / 127.5 - 1
@@ -191,7 +191,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
             else:
                 key_frame_latents.append(start_latent)
 
-        end_latent = vae_encode(end_image_pt, vae)
+        if end_image is not None:
+            end_latent = vae_encode(end_image_pt, vae)
 
         # CLIP Vision
 
@@ -247,7 +248,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
         for i, latent_padding in enumerate(latent_paddings):
             is_last_section = i == (total_latent_sections - 1)
-            latent_padding_size = latent_padding * latent_window_size
+            latent_padding_size = int(latent_padding * latent_window_size)
 
             if stream.input_queue.top() == 'end':
                 stream.output_queue.push(('end', None))
@@ -452,7 +453,7 @@ with block:
                 for i in range(10):
                     with gr.Row():
                         section_keyframes.append(gr.Image(sources='upload', type="numpy", label="Image", height=320, visible= i < first_total_sections))
-                        paddings.append(gr.Number(label=f"Section {i} Padding", minimum=-1, maximum=20, value=-1, step=1, visible= i < first_total_sections))
+                        paddings.append(gr.Number(label=f"Section {i} Padding", minimum=-1, maximum=20, value=-1, step=0.1, visible= i < first_total_sections))
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
