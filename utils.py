@@ -26,7 +26,7 @@ def load_model(f1=False):
     image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
     if f1:
-        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_f1_transformer_nf4', torch_dtype=torch.float16).cpu()
+        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_f1_transformer_nf4', torch_dtype=torch.bfloat16).cpu()
     else:
         transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_transformer_nf4', torch_dtype=torch.bfloat16).cpu()
         #transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
