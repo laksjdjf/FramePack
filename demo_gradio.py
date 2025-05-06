@@ -26,6 +26,7 @@ parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='127.0.0.1')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
+parser.add_argument("--f1", action='store_true')
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -33,7 +34,7 @@ args = parser.parse_args()
 
 print(args)
 
-text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer = load_model()
+text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer = load_model(args.f1)
 high_vram = get_cuda_free_memory_gb(gpu) > 60
 
 stream = AsyncStream()
@@ -42,7 +43,7 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, section_keyframes, paddings):
+def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, section_keyframes, paddings, frame_shifts):
     job_id = generate_timestamp()
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
@@ -149,9 +150,9 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = get_num_frames(latent_window_size)
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        history_latents = torch.zeros(size=(1, 16, post_frames + two_x_frames + four_x_frames, height // 8, width // 8), dtype=torch.float32).cpu()
         if end_image is not None and sampling == 'inverse':
-            history_latents[:, :, :1] = end_latent.to(history_latents)
+            history_latents[:, :, :1] = end_latent.to(history_latents) * end_strength
         if sampling == 'vanilla':
             history_latents[:, :, -1:] = start_latent.to(history_latents)
         history_pixels = None
@@ -184,21 +185,28 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
-            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, post_frames, two_x_frames, four_x_frames])).unsqueeze(0)
             if sampling == 'inverse':
-                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, post_frames, two_x_frames, four_x_frames], dim=1)
 
                 clean_latents_pre = key_frame_latents[i].to(history_latents)
-                clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+                clean_latent_indices_pre += frame_shifts[i]
+                clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :post_frames + two_x_frames + four_x_frames, :, :].split([post_frames, two_x_frames, four_x_frames], dim=2)
             elif sampling == 'vanilla':
-                clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_indices_post, latent_indices, blank_indices, clean_latent_indices_pre = indices.split([16, 2, 1, latent_window_size, latent_padding_size, 1], dim=1)
-                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-
+                clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_indices_post, latent_indices, blank_indices, clean_latent_indices_pre = indices.split([four_x_frames, two_x_frames, post_frames, latent_window_size, latent_padding_size, 1], dim=1)
+                clean_latent_indices_pre += frame_shifts[i]
                 clean_latents_pre = key_frame_latents[i].to(history_latents)
-                clean_latents_4x, clean_latents_2x, clean_latents_post = history_latents[:, :, -(1 + 2 + 16):, :, :].split([16, 2, 1], dim=2)
+                clean_latents_4x, clean_latents_2x, clean_latents_post = history_latents[:, :, -(post_frames + two_x_frames + four_x_frames):, :, :].split([four_x_frames, two_x_frames, post_frames], dim=2)
+                
+            if post_frames > 0:
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
                 clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+            else:
+                clean_latent_indices = clean_latent_indices_pre
+                clean_latents = clean_latents_pre
+            
+            clean_latents_2x = clean_latents_2x if two_x_frames else None
+            clean_latents_4x = clean_latents_4x if four_x_frames else None
 
             if not high_vram:
                 unload_complete_models()
@@ -256,6 +264,12 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
                 clean_latents_4x=clean_latents_4x,
                 clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
+                movement_scale=movement_scale,
+                angle=angle,
+                num_frames=latent_window_size * total_latent_sections if sin_range == 'full' else latent_window_size,
+                current_frame=total_generated_latent_frames if sin_range == 'full' else 0,
+                target_dim = -2 if hw == 'height' else -1,
+                target_steps=[int(x.strip()) for x in target_steps.split(',')] if target_steps else [],
             )
 
             if not high_vram:
@@ -263,7 +277,7 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
                 load_model_as_complete(vae, target_device=gpu)
 
             if sampling == 'inverse':
-                if is_last_section and paddings[i] == 0:
+                if is_last_section and latent_padding == 0 and input_image_pt is not None:
                     generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
                 total_generated_latent_frames += int(generated_latents.shape[2])
                 
@@ -318,7 +332,7 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
     return
 
 
-def process(input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, *args):
+def process(input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, *args):
     global stream
     #assert input_image is not None, 'No input image!'
 
@@ -328,8 +342,9 @@ def process(input_image, end_image, prompt, n_prompt, sampling, seed, total_seco
 
     section_keyframes = args[0:32]
     paddings = args[32:64]
+    frame_shifts = args[64:96]
 
-    async_run(worker, input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, section_keyframes, paddings)
+    async_run(worker, input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, section_keyframes, paddings, frame_shifts)
 
     output_filename = None
 
@@ -380,32 +395,45 @@ with block:
                 end_button = gr.Button(value="End Generation", interactive=False)
 
             with gr.Group():
+                end_strength = gr.Slider(label="End Strength", minimum=0.0, maximum=1.0, value=1.0, step=0.01, info='The strength of the end image. 0 means no effect, 1 means full effect.')
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
                 total_latent_sections = gr.Slider(label="Total Video Length (Sections)", minimum=1, maximum=120, value=5, step=1)
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
+                post_frames = gr.Slider(label="Frames of Clean latent post", minimum=0, maximum=128, value=1, step=1, visible=True)
+                two_x_frames = gr.Slider(label="Frames of Clean latent 2x", minimum=0, maximum=128, value=2, step=2, visible=True)
+                four_x_frames = gr.Slider(label="Frames of Clean latent 4x", minimum=0, maximum=128, value=16, step=4, visible=True)
+
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
             
             with gr.Group():
+                movement_scale = gr.Slider(label="Movement Scale", minimum=0.0, maximum=1.0, value=0.01, step=0.01, info='The scale of the movement. 0 means no movement, 1 means full movement.')
+                angle = gr.Slider(label="PI Scale", minimum=-2.0, maximum=2.0, value=1, step=0.01, info='The scale of the angle, 1 means 2pi')
+                sin_range = gr.Radio(label="sin range", choices=["section", "full"], value="section")
+                hw = gr.Radio(label="Height Width", choices=["height", "width"], value="height")
+                target_steps = gr.Textbox(label="Num Steps", value="")
+            with gr.Group():
                 first_total_sections = 5
                 section_title = gr.Markdown(f'## 総セクション数は{first_total_sections}だよーん。')
                 section_keyframes = []
                 paddings = []
+                frame_shifts = []
                 for i in range(32):
                     with gr.Row():
                         section_keyframes.append(gr.Image(sources='upload', type="numpy", label="Image", height=320, visible= i < first_total_sections))
                         paddings.append(gr.Number(label=f"Section {i} Padding", minimum=-0.1, maximum=20, value=-0.1, step=0.1, visible= i < first_total_sections))
+                        frame_shifts.append(gr.Number(label=f"Section {i} Frame Shift", minimum=-20, maximum=20, value=0, step=1, visible= i < first_total_sections))
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -416,14 +444,14 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf] + section_keyframes + paddings
+    ips = [input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw,target_steps] + section_keyframes + paddings + frame_shifts
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
     total_latent_sections.change(
         fn=section_title_update,
         inputs=[total_latent_sections],
-        outputs=[section_title] + section_keyframes + paddings,
+        outputs=[section_title] + section_keyframes + paddings + frame_shifts,
     )
 
 

@@ -8,7 +8,7 @@ from diffusers_helper.utils import resize_and_center_crop
 
 import gradio as gr
 
-def load_model():
+def load_model(f1=False):
     free_mem_gb = get_cuda_free_memory_gb(gpu)
     high_vram = free_mem_gb > 60
 
@@ -16,6 +16,7 @@ def load_model():
     print(f'High-VRAM Mode: {high_vram}')
 
     text_encoder = LlamaModel.from_pretrained("furusu/hv_llama_nf4", torch_dtype=torch.float16).cpu()
+    #text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
     text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
     tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
     tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
@@ -24,7 +25,11 @@ def load_model():
     feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
     image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_transformer_nf4', torch_dtype=torch.bfloat16).cpu()
+    if f1:
+        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_f1_transformer_nf4', torch_dtype=torch.float16).cpu()
+    else:
+        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('furusu/framepack_transformer_nf4', torch_dtype=torch.bfloat16).cpu()
+        #transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
 
     vae.eval()
     text_encoder.eval()
@@ -78,7 +83,7 @@ def get_num_frames(latent_window_size):
 
 def section_title_update(total_latent_sections):
     visibles = [gr.update(visible=True) for _ in range(total_latent_sections)] + [gr.update(visible=False) for _ in range(32 - total_latent_sections)]
-    output = [f'## 総セクション数は{total_latent_sections}だよーん。'] + visibles * 2
+    output = [f'## 総セクション数は{total_latent_sections}だよーん。'] + visibles * 3
     return output
 
 def get_image_np_pt(image, width, height):

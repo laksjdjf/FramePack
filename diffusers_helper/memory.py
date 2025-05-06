@@ -83,9 +83,13 @@ def get_cuda_free_memory_gb(device=None):
 
 def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
+    sum_params = sum(p.numel() for p in model.parameters())
+    gpu_params_pre = sum(p.numel() for p in model.parameters() if p.device.type == 'cuda')
 
     for m in model.modules():
         if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
+            gpu_params = sum(p.numel() for p in model.parameters() if p.device.type == 'cuda')
+            print(f"{gpu_params_pre / sum_params:.2%} => {gpu_params / sum_params:.2%} params of {model.__class__.__name__} is on GPU")
             torch.cuda.empty_cache()
             return
 
@@ -94,24 +98,31 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
 
     model.to(device=target_device)
     torch.cuda.empty_cache()
+    print(f"{gpu_params_pre / sum_params:.2%} => {1:.2%} params of {model.__class__.__name__} is on GPU")
+
     return
 
 
 def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0):
     print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
+    sum_params = sum(p.numel() for p in model.parameters())
+    gpu_params_pre = sum(p.numel() for p in model.parameters() if p.device.type == 'cuda')
 
     for m in model.modules():
         if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
+            gpu_params = sum(p.numel() for p in model.parameters() if p.device.type == 'cuda')
+        
+            print(f"{gpu_params_pre / sum_params:.2%} => {gpu_params / sum_params:.2%} params of {model.__class__.__name__} is on GPU")
             torch.cuda.empty_cache()
             return
 
         if hasattr(m, 'weight'):
-            m.to(device=cpu)
+            m.to(device="cpu")
 
     model.to(device=cpu)
     torch.cuda.empty_cache()
+    print(f"{gpu_params_pre / sum_params:.2%} => {0:.2%} params of {model.__class__.__name__} is on GPU")
     return
-
 
 def unload_complete_models(*args):
     for m in gpu_complete_modules + list(args):

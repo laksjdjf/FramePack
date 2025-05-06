@@ -5,6 +5,7 @@
 
 
 import torch
+import math
 
 from tqdm.auto import trange
 
@@ -18,6 +19,7 @@ class FlowMatchUniPC:
         self.model = model
         self.variant = variant
         self.extra_args = extra_args
+
 
     def model_fn(self, x, t):
         return self.model(x, t, **self.extra_args)
@@ -108,11 +110,18 @@ class FlowMatchUniPC:
 
         return x_t, model_t
 
-    def sample(self, x, sigmas, callback=None, disable_pbar=False):
+    def sample(self, x, sigmas, callback=None, disable_pbar=False, movement_scale=0, angle=0, num_frames=1, current_frame=0, target_dim=-1, target_steps=[]):
         order = min(3, len(sigmas) - 2)
         model_prev_list, t_prev_list = [], []
         for i in trange(len(sigmas) - 1, disable=disable_pbar):
             vec_t = sigmas[i].expand(x.shape[0])
+
+            if i in target_steps:
+                f = x.shape[2]
+                size = x.shape[target_dim]
+                for j in range(f):
+                    amount = math.sin((j + current_frame) / num_frames * math.pi * angle * 2) * size * movement_scale
+                    x[:,:,j,:,:] = torch.roll(x[:,:,j,:,:], int(amount), dims=target_dim)
 
             if i == 0:
                 model_prev_list = [self.model_fn(x, vec_t)]
@@ -136,6 +145,6 @@ class FlowMatchUniPC:
         return model_prev_list[-1]
 
 
-def sample_unipc(model, noise, sigmas, extra_args=None, callback=None, disable=False, variant='bh1'):
+def sample_unipc(model, noise, sigmas, extra_args=None, callback=None, disable=False, variant='bh1', movement_scale=0, angle=0, num_frames=1, current_frame=0, target_dim=-1, target_steps=[]):
     assert variant in ['bh1', 'bh2']
-    return FlowMatchUniPC(model, extra_args=extra_args, variant=variant).sample(noise, sigmas=sigmas, callback=callback, disable_pbar=disable)
+    return FlowMatchUniPC(model, extra_args=extra_args, variant=variant).sample(noise, sigmas=sigmas, callback=callback, disable_pbar=disable, movement_scale=movement_scale, angle=angle, num_frames=num_frames, current_frame=current_frame, target_dim=target_dim, target_steps=target_steps)
