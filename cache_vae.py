@@ -153,7 +153,8 @@ class AttnProcessor2_0_KVCache:
             attention_mask = torch.cat(
                 [torch.zeros(attention_mask.shape[0], attention_mask.shape[1],  attention_mask.shape[2], self.k_cache.shape[2]).to(attention_mask), attention_mask], dim=3
             )
-
+        
+        
         self.k_cache = key.clone()
         self.v_cache = value.clone()
 
@@ -196,7 +197,7 @@ def hook_vae(vae):
             module._orginal_forward = module.forward
             module.forward = hook_forward_upsample(module)
         if module.__class__.__name__ == "Attention":
-            module._orginal_forward = module.forward
+            module._orginal_processor = module.processor
             module.processor = AttnProcessor2_0_KVCache()
 
 def restore_vae(vae):
@@ -212,9 +213,9 @@ def restore_vae(vae):
             module.forward = module._orginal_forward
             module.conv.cache = None
         if module.__class__.__name__ == "Attention":
-            module.forward = module._orginal_forward
             module.processor.k_cache = None
             module.processor.v_cache = None
+            module.processor = module._orginal_processor
     
 @torch.no_grad()
 def vae_decode_cache(latents, vae):
