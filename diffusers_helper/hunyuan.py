@@ -89,17 +89,90 @@ def vae_decode_fake(latents):
 
     return images
 
+def hook_forward_conv3d(self):
+    # replace HunyuanVideoCausalConv3d.forward
+    def forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = torch.nn.functional.pad(hidden_states, self.time_causal_padding, mode=self.pad_mode)
+        if self.time_causal_padding[4] > 0:
+            if hasattr(self, "cache") and self.cache is not None:
+                hidden_states[:, :, :self.time_causal_padding[4]] = self.cache.clone() # copy cache to the top frames
+            self.cache = hidden_states[:, :, -self.time_causal_padding[4]:].clone() # cache the last frames
+        return self.conv(hidden_states)
+    return forward
+
+def hook_forward_upsample(self):
+    # replace HunyuanVideoUpsampleCausal3D.forward
+    def forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.conv, "cache") and self.conv.cache is not None:
+            # upsample all frames if cache is used
+            hidden_states = torch.nn.functional.interpolate(hidden_states.contiguous(), scale_factor=self.upsample_factor, mode="nearest")
+        else:
+            num_frames = hidden_states.size(2)
+
+            first_frame, other_frames = hidden_states.split((1, num_frames - 1), dim=2)
+            first_frame = torch.nn.functional.interpolate(
+                first_frame.squeeze(2), scale_factor=self.upsample_factor[1:], mode="nearest"
+            ).unsqueeze(2)
+
+            if num_frames > 1:
+                # See: https://github.com/pytorch/pytorch/issues/81665
+                # Unless you have a version of pytorch where non-contiguous implementation of F.interpolate
+                # is fixed, this will raise either a runtime error, or fail silently with bad outputs.
+                # If you are encountering an error here, make sure to try running encoding/decoding with
+                # `vae.enable_tiling()` first. If that doesn't work, open an issue at:
+                # https://github.com/huggingface/diffusers/issues
+                other_frames = other_frames.contiguous()
+                other_frames = torch.nn.functional.interpolate(other_frames, scale_factor=self.upsample_factor, mode="nearest")
+                hidden_states = torch.cat((first_frame, other_frames), dim=2)
+            else:
+                hidden_states = first_frame
+
+        hidden_states = self.conv(hidden_states)
+        return hidden_states
+    return forward
+
+def hook_vae(vae):
+    vae._original_use_framewise_decoding = vae.use_framewise_decoding
+    vae._original_use_slicing = vae.use_slicing
+    vae._original_use_tiling = vae.use_tiling
+    vae.use_framewise_decoding = False
+    vae.use_slicing = False
+    vae.use_tiling = False
+    for module in vae.decoder.modules():
+        if module.__class__.__name__ == "HunyuanVideoCausalConv3d":
+            module._orginal_forward = module.forward
+            module.forward = hook_forward_conv3d(module)
+        if module.__class__.__name__ == "HunyuanVideoUpsampleCausal3D":
+            module._orginal_forward = module.forward
+            module.forward = hook_forward_upsample(module)
+
+def restore_vae(vae):
+    vae.use_framewise_decoding = vae._original_use_framewise_decoding
+    vae.use_slicing = vae._original_use_slicing
+    vae.use_tiling = vae._original_use_tiling
+
+    for module in vae.decoder.modules():
+        if module.__class__.__name__ == "HunyuanVideoCausalConv3d":
+            module.forward = module._orginal_forward
+            module.cache = None
+        if module.__class__.__name__ == "HunyuanVideoUpsampleCausal3D":
+            module.forward = module._orginal_forward
 
 @torch.no_grad()
-def vae_decode(latents, vae, image_mode=False):
+def vae_decode(latents, vae):
     latents = latents / vae.config.scaling_factor
-
-    if not image_mode:
-        image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
-    else:
-        latents = latents.to(device=vae.device, dtype=vae.dtype).unbind(2)
-        image = [vae.decode(l.unsqueeze(2)).sample for l in latents]
-        image = torch.cat(image, dim=2)
+    frames = latents.shape[2]
+    hook_vae(vae)
+    
+    for i in range(frames):
+        latents_slice = latents[:, :, i:i+1, :, :]
+        image_slice = vae.decode(latents_slice.to(device=vae.device, dtype=vae.dtype)).sample
+        
+        if i == 0:
+            image = image_slice
+        else:
+            image = torch.cat((image, image_slice), dim=2)
+    restore_vae(vae)
 
     return image
 
