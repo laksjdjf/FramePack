@@ -2,48 +2,22 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
-'''
-class HunyuanVideoCausalConv3d(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: Union[int, Tuple[int, int, int]] = 3,
-        stride: Union[int, Tuple[int, int, int]] = 1,
-        padding: Union[int, Tuple[int, int, int]] = 0,
-        dilation: Union[int, Tuple[int, int, int]] = 1,
-        bias: bool = True,
-        pad_mode: str = "replicate",
-    ) -> None:
-        super().__init__()
-
-        kernel_size = (kernel_size, kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
-
-        self.pad_mode = pad_mode
-        self.time_causal_padding = (
-            kernel_size[0] // 2,
-            kernel_size[0] // 2,
-            kernel_size[1] // 2,
-            kernel_size[1] // 2,
-            kernel_size[2] - 1,
-            0,
-        )
-
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding, dilation, bias=bias)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = F.pad(hidden_states, self.time_causal_padding, mode=self.pad_mode)
-        return self.conv(hidden_states)
-'''
-
 def hook_forward_conv3d(self):
     # replace HunyuanVideoCausalConv3d.forward
     def forward(hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = F.pad(hidden_states, self.time_causal_padding, mode=self.pad_mode)
         if self.time_causal_padding[4] > 0:
+            t = self.time_causal_padding[4]
+            padding = (self.time_causal_padding[0], self.time_causal_padding[1], self.time_causal_padding[2], self.time_causal_padding[3], 0, 0)
+            
             if hasattr(self, "cache") and self.cache is not None:
-                hidden_states[:, :, :self.time_causal_padding[4]] = self.cache.clone() # copy cache to the top frames
-            self.cache = hidden_states[:, :, -self.time_causal_padding[4]:].clone() # cache the last frames
+                cache = self.cache.to(hidden_states)
+                hidden_states = torch.cat([cache, hidden_states], dim=2)
+            else:
+                hidden_states = F.pad(hidden_states, (0, 0, 0, 0, t, 0), mode=self.pad_mode)
+            self.cache = hidden_states[:, :, -t:].clone()
+            hidden_states = F.pad(hidden_states, padding, mode=self.pad_mode)
+        else:
+            hidden_states = F.pad(hidden_states, self.time_causal_padding, mode=self.pad_mode)
         return self.conv(hidden_states)
     return forward
 
@@ -76,6 +50,23 @@ def hook_forward_upsample(self):
 
         hidden_states = self.conv(hidden_states)
         return hidden_states
+    return forward
+
+def hook_forward_groupnorm(org_forward, h, w):
+    # replace HunyuanVideoGroupNorm.forward
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        nonlocal h, w
+        if x.ndim == 5:
+            b, c, t, h, w = x.shape
+            x = x.transpose(1, 2).reshape(b * t, c, h, w)
+            x = org_forward(x)
+            x = x.reshape(b, t, c, h, w).transpose(1, 2)
+        else:
+            b, c, n = x.shape
+            x = x.reshape(b, c, -1, h * w).transpose(1, 2).reshape(-1, c, h * w)
+            x = org_forward(x)
+            x = x.reshape(b, -1, c, h * w).transpose(1, 2).reshape(b, c, n)
+        return x
     return forward
 
 # AttnProcessor2_0 with KVCache
@@ -154,9 +145,8 @@ class AttnProcessor2_0_KVCache:
                 [torch.zeros(attention_mask.shape[0], attention_mask.shape[1],  attention_mask.shape[2], self.k_cache.shape[2]).to(attention_mask), attention_mask], dim=3
             )
         
-        
-        self.k_cache = key.clone()
-        self.v_cache = value.clone()
+        self.k_cache = key
+        self.v_cache = value
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
@@ -183,12 +173,6 @@ class AttnProcessor2_0_KVCache:
         return hidden_states
     
 def hook_vae(vae):
-    vae._original_use_framewise_decoding = vae.use_framewise_decoding
-    vae._original_use_slicing = vae.use_slicing
-    vae._original_use_tiling = vae.use_tiling
-    vae.use_framewise_decoding = False
-    vae.use_slicing = False
-    vae.use_tiling = False
     for module in vae.decoder.modules():
         if module.__class__.__name__ == "HunyuanVideoCausalConv3d":
             module._orginal_forward = module.forward
@@ -201,113 +185,71 @@ def hook_vae(vae):
             module.processor = AttnProcessor2_0_KVCache()
 
 def restore_vae(vae):
-    vae.use_framewise_decoding = vae._original_use_framewise_decoding
-    vae.use_slicing = vae._original_use_slicing
-    vae.use_tiling = vae._original_use_tiling
-
     for module in vae.decoder.modules():
         if module.__class__.__name__ == "HunyuanVideoCausalConv3d":
             module.forward = module._orginal_forward
             module.cache = None
         if module.__class__.__name__ == "HunyuanVideoUpsampleCausal3D":
             module.forward = module._orginal_forward
-            module.conv.cache = None
         if module.__class__.__name__ == "Attention":
             module.processor.k_cache = None
             module.processor.v_cache = None
             module.processor = module._orginal_processor
-    
+
+def fix_groupnorm(vae, h, w):
+    for module in vae.decoder.modules():
+        if module.__class__.__name__ == "GroupNorm":
+            module._orginal_forward = module.forward
+            module.forward = hook_forward_groupnorm(module._orginal_forward, h, w)
+
+def restore_groupnorm(vae):
+    for module in vae.decoder.modules():
+        if module.__class__.__name__ == "GroupNorm":
+            module.forward = module._orginal_forward
+            module._orginal_forward = None
+
 @torch.no_grad()
 def vae_decode_cache(latents, vae):
     latents = latents / vae.config.scaling_factor
     frames = latents.shape[2]
     hook_vae(vae)
     
-    for i in range(frames):
-        latents_slice = latents[:, :, i:i+1, :, :]
-        image_slice = vae.decode(latents_slice.to(device=vae.device, dtype=vae.dtype)).sample
+    tile_rate = 1
+    latents = latents.to(device=vae.device, dtype=vae.dtype)
+    images = []
+    for i in range(0, frames, tile_rate):
+        z = vae.post_quant_conv(latents[:, :, i:i + tile_rate, :, :])
+        dec = vae.decoder(z)
         
-        if i == 0:
-            image = image_slice
-        else:
-            image = torch.cat((image, image_slice), dim=2)
+        images.append(dec)
+    image = torch.cat(images, dim=2)
     restore_vae(vae)
 
     return image
 
+@torch.no_grad()
+def vae_decode_tiling(latents, vae):
+    latents = latents / vae.config.scaling_factor
+    image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
+    return image
+
+@torch.no_grad()
+def vae_decode(latents, vae):
+    latents = latents / vae.config.scaling_factor
+    z = vae.post_quant_conv(latents.to(device=vae.device, dtype=vae.dtype))
+    image = vae.decoder(z)
+    return image
     
 if __name__ == "__main__":
     from diffusers import AutoencoderKLHunyuanVideo
-    from diffusers_helper.bucket_tools import find_nearest_bucket
-    from diffusers_helper.utils import resize_and_center_crop, save_bcthw_as_mp4
-    from diffusers_helper.hunyuan import vae_decode, vae_encode
     import torch
-    import cv2
-    from PIL import Image
-    import time
-    import numpy as np
+    vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float32).cuda().eval()
 
-    def mp4_to_pil_images(video_path):
-        cap = cv2.VideoCapture(video_path)
-        images = []
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # BGR（OpenCV）→ RGB（PIL）
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(frame_rgb)
-            images.append(pil_image)
-
-        cap.release()
-        return images
-    
-    vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cuda()
-    vae.eval().requires_grad_(False)
-    vae.enable_slicing()
-    vae.enable_tiling()
-
-    video_file = 'outputs/250428_092032_789_7426_19.mp4'
-    image_list = mp4_to_pil_images(video_file)
-
-    movie_pt = []
-    height, width = find_nearest_bucket(image_list[0].size[1], image_list[0].size[0], resolution=640)
-    for image in image_list:
-        image_np = resize_and_center_crop(np.array(image), target_width=width, target_height=height)
-        image_pt = torch.from_numpy(image_np).float() / 127.5 - 1
-        image_pt = image_pt.permute(2, 0, 1)[None, :, None]
-        movie_pt.append(image_pt)
-    movie_pt = torch.cat(movie_pt, dim=2).cuda().half()
+    x = torch.randn(1, 16, 9, 32, 32).cuda()
+    fix_groupnorm(vae, 32, 32)
 
     with torch.no_grad():
-        latents = vae_encode(movie_pt, vae)
+        decoded_o = vae_decode(x, vae)
+        decoded_c = vae_decode_cache(x, vae)
 
-    print("encoded latents shape:", latents.shape)
-
-    # original vae_decode
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-    with torch.no_grad():
-        start = time.time()
-        images_o = vae_decode(latents, vae)
-        torch.cuda.synchronize()  # GPU処理の同期
-        end = time.time()
-        
-        mem_o = torch.cuda.max_memory_allocated()
-        print(f"vae_decode() 使用メモリ: {mem_o / (1024**2):.2f} MB 実行時間{end - start:.4f} 秒")
-
-    # vae_decode_cache
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-    with torch.no_grad():
-        start = time.time()
-        images_c = vae_decode_cache(latents, vae)
-        torch.cuda.synchronize()
-        end = time.time()
-        
-        mem_c = torch.cuda.max_memory_allocated()
-        print(f"vae_decode_cache() 使用メモリ: {mem_c / (1024**2):.2f} MB 実行時間{end - start:.4f} 秒")
-
-    print((images_o-images_c).abs().mean())
-    x = save_bcthw_as_mp4(torch.cat([movie_pt, images_o, images_c]), "test.mp4", 30, 16)
+    print((decoded_o - decoded_c).abs().mean(dim=(0,1,3,4)).cpu().numpy())
