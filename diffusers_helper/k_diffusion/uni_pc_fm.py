@@ -113,6 +113,7 @@ class FlowMatchUniPC:
     def sample(self, x, sigmas, callback=None, disable_pbar=False, movement_scale=0, angle=0, num_frames=1, current_frame=0, target_dim=-1, target_steps=[]):
         order = min(3, len(sigmas) - 2)
         model_prev_list, t_prev_list = [], []
+        target_steps = [] if target_steps is None else target_steps
         for i in trange(len(sigmas) - 1, disable=disable_pbar):
             vec_t = sigmas[i].expand(x.shape[0])
 

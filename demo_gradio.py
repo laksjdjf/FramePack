@@ -43,9 +43,8 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, section_keyframes, paddings, frame_shifts):
+def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, end_mask_alpha, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, section_keyframes, paddings, frame_shifts):
     job_id = generate_timestamp()
-
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
@@ -58,6 +57,10 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
         # Text encoding
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
+
+        end_image_mask = end_image["layers"][0][:,:,3]
+        end_image_mask = np.repeat(end_image_mask[..., None], 3, axis=2)    
+        end_image = end_image["background"][:,:,:3]
 
         if not high_vram:
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
@@ -80,6 +83,11 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
         H, W, C = input_image.shape if input_image is not None else end_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np, input_image_pt = get_image_np_pt(input_image, width, height)
+
+        end_image_mask_np, end_image_mask_pt = get_image_np_pt(end_image_mask, width // 8, height // 8)
+        end_image_mask_pt = (1 - ((end_image_mask_pt + 1) / 2) * end_mask_alpha)
+        print(end_image_mask_pt.mean(dim=(0, 2, 3, 4)))
+        end_image_mask_pt = end_image_mask_pt[:, :1, :, :]
         
         #Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
 
@@ -99,11 +107,13 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
 
         if input_image_pt is None:
             end_latent = vae_encode(end_image_pt, vae)
+            end_latent = end_latent * end_image_mask_pt.to(end_latent)
             start_latent = torch.zeros_like(end_latent)
         else:
             start_latent = vae_encode(input_image_pt, vae)
             if end_image_pt is not None:
                 end_latent = vae_encode(end_image_pt, vae)
+                end_latent = end_latent * end_image_mask_pt.to(end_latent)
             else:
                 end_latent = torch.zeros_like(start_latent)
 
@@ -292,7 +302,21 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
                     overlapped_frames = num_frames
 
                     current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                    history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+
+                    if total_generated_latent_frames > section_latent_frames:
+                        '''
+                        mse_losses = []
+                        for i in range(-3, 4):
+                            mse_loss = torch.nn.functional.mse_loss(current_pixels[:, :, -(overlapped_frames+i):], history_pixels[:, :, :overlapped_frames+i], reduction='mean')
+                            mse_losses.append(mse_loss)
+                        mse_losses = torch.stack(mse_losses)
+                        print(f'mse_losses = {mse_losses}')
+                        argmin = torch.argmin(mse_losses).item()
+                        overlapped_frames = num_frames + argmin - 3
+                        '''
+                        history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                    else:
+                        history_pixels = current_pixels
             elif sampling == 'vanilla':
                 total_generated_latent_frames += int(generated_latents.shape[2])
                 history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
@@ -301,11 +325,25 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
                 if history_pixels is None:
                     history_pixels = vae_decode(real_history_latents, vae).cpu()
                 else:
-                    section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+                    section_latent_frames = latent_window_size * 2
                     overlapped_frames = num_frames
 
                     current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
-                    history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
+                    
+                    if total_generated_latent_frames > section_latent_frames:
+                        '''
+                        mse_losses = []
+                        for i in range(-3, 4):
+                            mse_loss = torch.nn.functional.mse_loss(current_pixels[:, :, -(overlapped_frames+i):], history_pixels[:, :, :overlapped_frames+i], reduction='mean')
+                            mse_losses.append(mse_loss)
+                        mse_losses = torch.stack(mse_losses)
+                        print(f'mse_losses = {mse_losses}')
+                        argmin = torch.argmin(mse_losses).item()
+                        overlapped_frames = num_frames + argmin - 3
+                        '''
+                        history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
+                    else:
+                        history_pixels = current_pixels
 
             if not high_vram:
                 unload_complete_models()
@@ -332,7 +370,7 @@ def worker(input_image, end_image, prompt, n_prompt, sampling, seed, total_laten
     return
 
 
-def process(input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, *args):
+def process(input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, end_mask_alpha, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, *args):
     global stream
     #assert input_image is not None, 'No input image!'
 
@@ -344,7 +382,7 @@ def process(input_image, end_image, prompt, n_prompt, sampling, seed, total_seco
     paddings = args[32:64]
     frame_shifts = args[64:96]
 
-    async_run(worker, input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, section_keyframes, paddings, frame_shifts)
+    async_run(worker, input_image, end_image, prompt, n_prompt, sampling, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, end_mask_alpha, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw, target_steps, section_keyframes, paddings, frame_shifts)
 
     output_filename = None
 
@@ -382,8 +420,9 @@ with block:
     with gr.Row():
         with gr.Column():
             with gr.Row():
-                input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
-                end_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+                input_image = gr.Image(sources='upload', type="numpy", label="Image", height=640, show_fullscreen_button=True)
+                end_image = gr.ImageMask(sources='upload', type="numpy", label="Image", height=640, show_fullscreen_button=True)
+            end_mask_alpha = gr.Slider(label="end mask alpha", minimum=0.0, maximum=1.0, value=1.0, step=0.01, visible=True)  # Not used
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
@@ -432,8 +471,8 @@ with block:
                 for i in range(32):
                     with gr.Row():
                         section_keyframes.append(gr.Image(sources='upload', type="numpy", label="Image", height=320, visible= i < first_total_sections))
-                        paddings.append(gr.Number(label=f"Section {i} Padding", minimum=-0.1, maximum=20, value=-0.1, step=0.1, visible= i < first_total_sections))
-                        frame_shifts.append(gr.Number(label=f"Section {i} Frame Shift", minimum=-20, maximum=20, value=0, step=1, visible= i < first_total_sections))
+                        paddings.append(gr.Number(label=f"Section {i} Padding", minimum=-0.1, maximum=128, value=-0.1, step=0.1, visible= i < first_total_sections))
+                        frame_shifts.append(gr.Number(label=f"Section {i} Frame Shift", minimum=-128, maximum=128, value=0, step=1, visible= i < first_total_sections))
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -444,7 +483,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw,target_steps] + section_keyframes + paddings + frame_shifts
+    ips = [input_image, end_image, prompt, n_prompt, sampling, seed, total_latent_sections, latent_window_size, steps, cfg, gs, rs, post_frames, two_x_frames, four_x_frames, end_mask_alpha, gpu_memory_preservation, end_strength, use_teacache, mp4_crf, movement_scale, angle, sin_range, hw,target_steps] + section_keyframes + paddings + frame_shifts
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
